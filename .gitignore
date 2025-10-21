@@ -1,0 +1,13 @@
+# Python venv
+.venv/
+
+# __pycache__
+/backend/__pycache__/
+/backend/**/__pycache__/
+
+# models: 폴더 자체는 보존(예: .gitkeep만 추적), 내부 파일은 무시
+/backend/models/**
+!/backend/models/.gitkeep
+
+# Node
+/frontend/node_modules/

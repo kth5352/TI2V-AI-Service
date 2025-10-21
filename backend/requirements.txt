@@ -1,0 +1,19 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+pillow==10.4.0
+numpy==2.1.2
+torch==2.5.1+cu121; platform_system=="Windows"
+torchaudio==2.5.1+cu121; platform_system=="Windows"
+torchvision==0.20.1+cu121; platform_system=="Windows"
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+transformers==4.45.2
+accelerate==1.0.1
+huggingface_hub
+ftfy
+diffusers
+imageio-ffmpeg
+imageio
+hf_transfer
