@@ -1,5 +1,6 @@
 # backend/video_worker.py — WAN2.2 I2V/T2V
-# 진행률(SSE) + 안전 워밍업 + VRAM기반 자동 스케일 + 동적 콜백 호환 + 출력 안전 추출 + 인코딩 진행 표시 + 에러코드
+# 진행률(SSE) + 안전 워밍업 + 세그먼트(25f) + 6f 크로스페이드 + I2V 앵커 리셋
+# + VRAM 안전 스냅 + 동적 콜백 호환 + 출력 안전 추출 + 인코딩 진행 표시 + 에러코드
 import io
 import os
 import uuid
@@ -84,6 +85,18 @@ except Exception:
     RESAMPLE_BICUBIC = PILImage.BICUBIC
 
 # ------------------------------
+# 튜닝 파라미터 (필요시 조정)
+# ------------------------------
+SEG_LEN_PREF = 25     # 세그먼트 길이 기본값(권장). (n-1)%4==0 만족 (25->OK)
+OVERLAP = 6           # 세그먼트 경계 크로스페이드 프레임 수
+MAX_FRAMES_PER_CALL = 121  # WAN 제한 안전값
+
+# I2V 안정화 옵션
+USE_ANCHOR_EVERY_SEG = True  # 세그먼트 시작마다 원본으로 리셋(권장)
+USE_BLEND = False            # 리셋 대신 원본/직전프레임 블렌드 사용 시 True
+ALPHA_ORIG = 0.7             # 블렌드 시 원본 비중 (0~1)
+
+# ------------------------------
 # 유틸
 # ------------------------------
 def _gpu_str() -> str:
@@ -115,7 +128,6 @@ def _maybe_fix_truncated_jpeg(b: bytes) -> bytes:
     if not b:
         return b
     try:
-        # JPEG SOI: 0xFFD8
         if len(b) >= 2 and b[0] == 0xFF and b[1] == 0xD8 and not b.endswith(b"\xFF\xD9"):
             log.warning("[IMAGE] JPEG missing EOI, appending 0xFFD9.")
             return b + b"\xFF\xD9"
@@ -130,24 +142,18 @@ def _pil_from_bytes(b: bytes) -> PILImage.Image:
         raise ValueError("Empty image bytes.")
     bb = _maybe_fix_truncated_jpeg(b)
     bio = io.BytesIO(bb)
-
-    # 1차: 정상 로드 시도
     try:
         img = PILImage.open(bio)
-        img.load()  # 실제 디코딩 강제
+        img.load()
     except Exception as e1:
-        # 2차: tolerant 로더 재시도
         log.warning(f"[IMAGE] first load failed: {e1}. Retrying tolerant loader.")
         bio.seek(0)
         img = PILImage.open(bio)
         img.load()
-
-    # EXIF 회전 보정
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
-
     return img.convert("RGB")
 
 
@@ -184,39 +190,107 @@ def _budget_megapixels(w: int, h: int, frames: int) -> float:
 
 
 def _autoscale_for_vram(
-    w: int, h: int, frames: int, steps: int, vram_gb: float = 12.0
+    w: int, h: int, frames: int, steps: int, vram_gb: float | None = None
 ) -> Tuple[int, int, int, int]:
     """
-    12GB 기준 보수적 설정:
-      - 스텝 상한 28
-      - 총 MP ~12MP 목표로 축소
+    해상도/프레임은 프론트 입력을 최대한 존중하되, 프레임 규칙만 보정.
+    스텝은 요청대로 28 고정.
     """
-    def nearest_valid(n: int) -> int:
-        if (n - 1) % 4 == 0:
-            return n
-        return int(round((n - 1) / 4.0) * 4 + 1)
+    frames = _nearest_valid_frames(frames)
+    steps = 28
+    return w, h, frames, steps
 
-    frames = nearest_valid(frames)
-    steps = 100
+# ------------------------------
+# 세그먼트 플래너 & 크로스페이드
+# ------------------------------
+def _plan_segments(total_frames: int, seg_len_pref: int = SEG_LEN_PREF, overlap: int = OVERLAP) -> List[int]:
+    """
+    총 프레임(total_frames)을 세그먼트들로 쪼갠다.
+    각 세그 길이는 (n-1)%4==0 만족. 첫 세그는 오버랩 없이, 이후 세그는 overlap만큼
+    이전과 겹치며, 최종 합성 결과가 정확히 total_frames가 되도록 길이를 조정한다.
+    """
+    if total_frames <= 0:
+        return []
+    segs: List[int] = []
+    eff_acc = 0  # 실제로 쌓이는 유효 프레임(오버랩 제외)
 
-    return w, h, nearest_valid(frames), steps
+    pref = _nearest_valid_frames(max(9, seg_len_pref))
+    while eff_acc < total_frames:
+        if not segs:
+            # 첫 세그: 전 오버랩 없음
+            need = total_frames - eff_acc
+            L = min(pref, need if need <= MAX_FRAMES_PER_CALL else pref)
+            L = _nearest_valid_frames(max(9, min(MAX_FRAMES_PER_CALL, L)))
+            segs.append(L)
+            eff_acc += L
+        else:
+            # 이후 세그: 오버랩만큼은 실효 X
+            need = total_frames - eff_acc
+            # 이번 세그의 유효 기여 = L - overlap
+            # need를 넘지 않도록 L을 정한다
+            L_eff_target = min(pref - overlap, need)  # 유효 기여 목표
+            L = L_eff_target + overlap
+            # 규칙/상한 보정
+            L = _nearest_valid_frames(max(9, min(MAX_FRAMES_PER_CALL, L)))
+            # 혹시 유효 기여가 0 이하로 나오면 최소 길이로 강제
+            if L - overlap <= 0:
+                L = _nearest_valid_frames(max(9, overlap + 1))
+            segs.append(L)
+            eff_acc += max(0, L - overlap)
+
+        # 마지막에 살짝 오버/언더가 생기면 다음 루프에서 보정됨
+
+    # 마지막 세그가 너무 과한 경우(유효 기여가 total_frames를 크게 초과) 미세 조정
+    # 실무상 거의 안 걸리지만 안전용.
+    eff_total = segs[0] + sum(max(0, L - overlap) for L in segs[1:])
+    if eff_total != total_frames:
+        delta = eff_total - total_frames
+        # delta>0이면 마지막 세그 길이를 줄여본다.
+        if delta > 0 and len(segs) >= 1:
+            L_last = segs[-1]
+            # 마지막 세그 유효 기여는 (L_last - overlap) (첫 세그면 그냥 L_last)
+            if len(segs) == 1:
+                target = max(9, L_last - delta)
+                segs[-1] = _nearest_valid_frames(target)
+            else:
+                target_eff = max(1, (L_last - overlap) - delta)
+                segs[-1] = _nearest_valid_frames(target_eff + overlap)
+
+    return segs
 
 
+def _crossfade_frames(tail: List[np.ndarray], head: List[np.ndarray], overlap: int) -> List[np.ndarray]:
+    """
+    두 시퀀스 사이를 overlap 길이만큼 프레임별 알파블렌딩으로 연결.
+    tail[-overlap:], head[:overlap]를 같은 길이로 맞춘 뒤 0→1 선형 가중으로 합성.
+    """
+    if overlap <= 0:
+        return []
+    n = min(overlap, len(tail), len(head))
+    if n <= 0:
+        return []
+    out = []
+    for i in range(n):
+        a = (i + 1) / (n + 1)  # 0~1 사이(끝쪽이 head 쪽 비중)
+        t = tail[-n + i].astype(np.float32)
+        h = head[i].astype(np.float32)
+        b = (1.0 - a) * t + a * h
+        out.append(np.clip(b, 0, 255).astype(np.uint8))
+    return out
+
+# ------------------------------
+# 파이프라인 로딩
+# ------------------------------
 def _apply_memory_savers(pipe, *, is_i2v: bool):
-    # 공통: attention slicing
     try:
         pipe.enable_attention_slicing()
     except Exception:
         pass
-
-    # ⛔ I2V에선 vae_tiling 금지 (채널 mismatch 방지)
     if not is_i2v:
         try:
             pipe.enable_vae_tiling()
         except Exception:
             pass
-
-    # xFormers는 Windows 기본 OFF 설정(_USE_XFORMERS)
     if _USE_XFORMERS:
         try:
             pipe.enable_xformers_memory_efficient_attention()
@@ -254,9 +328,7 @@ def _warmup_once(pipe, is_i2v: bool):
     else:
         _WARMED_T2V = True
 
-# ------------------------------
-# 파이프라인 로딩
-# ------------------------------
+
 def get_t2v_pipe():
     global _PIPE_T2V
     if _PIPE_T2V is None:
@@ -286,32 +358,22 @@ def get_i2v_pipe():
                     MODEL_ID, torch_dtype=_dtype, local_files_only=True
                 )
                 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-
-                # I2V: attention slicing만 (vae_tiling 금지)
                 _apply_memory_savers(pipe, is_i2v=True)
-
-                # 기본 GPU 고정
                 pipe.to(_device)
-
-                # ✅ 연산 병목 감소: model-level CPU Offload (Sequential보다 디코딩/후처리 유리)
                 try:
                     pipe.enable_model_cpu_offload()
                     log.info("[PIPE] I2V enabled MODEL CPU Offload.")
                 except Exception:
                     pipe.to(_device)
-
-                # 필요시 VAE를 CUDA에 고정 (offload 환경에서도 디코딩 가속)
                 try:
                     pipe.vae.to(_device)
                     log.info("[PIPE] I2V VAE pinned on GPU.")
                 except Exception:
                     pass
-
                 log.info(f"[PIPE] I2V loaded on {_device} ({_gpu_str()}); dtype={_dtype}")
                 _warmup_once(pipe, is_i2v=True)
                 _PIPE_I2V = pipe
     return _PIPE_I2V
-
 
 # ------------------------------
 # 출력 → 프레임 리스트 표준화
@@ -327,9 +389,7 @@ def _to_uint8_hwc(arr: np.ndarray) -> np.ndarray:
         a = np.clip(a, 0, 255).astype(np.uint8)
     else:
         a = arr
-
     if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[-1] not in (1, 3):
-        # (C,H,W) → (H,W,C)
         a = np.transpose(a, (1, 2, 0))
     return a
 
@@ -343,81 +403,64 @@ def _extract_frames(job_id: str, out_obj) -> List[np.ndarray]:
     반환: [np.uint8(H,W,C), ...]
     """
     log.info(f"[JOB {job_id[:8]}] Output type: {type(out_obj)}")
-
-    # 1) out.frames 케이스
     if hasattr(out_obj, "frames"):
         frames = getattr(out_obj, "frames")
         seq = frames[0] if isinstance(frames, (list, tuple)) and len(frames) > 0 else frames
         log.info(f"[JOB {job_id[:8]}] Frame source: out.frames (len={len(seq) if hasattr(seq,'__len__') else 'na'})")
         return _normalize_frame_sequence(job_id, seq)
-
-    # 2) out.videos
     if hasattr(out_obj, "videos"):
         vids = getattr(out_obj, "videos")
-        if hasattr(vids, "cpu"):  # torch.Tensor
+        if hasattr(vids, "cpu"):
             vids = vids.detach().cpu().numpy()
-        if isinstance(vids, np.ndarray):
-            if vids.ndim == 5:
-                b, f = vids.shape[0], vids.shape[1]
-                if b == 0 or f == 0:
-                    raise ValueError("videos is empty.")
-                if vids.shape[2] in (1, 3):      # (B,F,C,H,W) → (F,H,W,C)
-                    seq = np.transpose(vids[0], (0, 2, 3, 1))
-                else:                             # (B,F,H,W,C) → (F,H,W,C)
-                    seq = vids[0]
-                log.info(f"[JOB {job_id[:8]}] Frame source: out.videos (B={b},F={f})")
-                return [_to_uint8_hwc(fr) for fr in seq]
+        if isinstance(vids, np.ndarray) and vids.ndim == 5:
+            if vids.shape[2] in (1, 3):
+                seq = np.transpose(vids[0], (0, 2, 3, 1))
+            else:
+                seq = vids[0]
+            log.info(f"[JOB {job_id[:8]}] Frame source: out.videos (B={vids.shape[0]},F={vids.shape[1]})")
+            return [_to_uint8_hwc(fr) for fr in seq]
         raise AttributeError("Unsupported 'videos' format.")
-
-    # 3) list/tuple 첫 요소
     if isinstance(out_obj, (list, tuple)):
         if len(out_obj) == 0:
             raise AttributeError("Pipeline returned empty list/tuple.")
         log.info(f"[JOB {job_id[:8]}] Frame source: out[0] (list/tuple)")
         return _normalize_frame_sequence(job_id, out_obj[0])
-
-    # 4) dict-like
     if isinstance(out_obj, dict):
         for k in ("frames", "videos"):
             if k in out_obj:
                 return _extract_frames(job_id, SimpleNamespace(**out_obj))
         raise AttributeError("Dict output without 'frames' or 'videos'.")
-
     raise AttributeError(f"Unexpected pipeline output type: {type(out_obj)}")
 
 
 def _normalize_frame_sequence(job_id: str, seq) -> List[np.ndarray]:
     """PIL / np / tensor 혼재를 [np.uint8 HWC] 리스트로 표준화."""
     frames_u8: List[np.ndarray] = []
-
-    # 시퀀스가 tensor/numpy 한 덩어리일 수도 있음: (F,C,H,W) or (F,H,W,C) 또는 5D
     if (hasattr(seq, "cpu") and not isinstance(seq, (list, tuple))) or isinstance(seq, np.ndarray):
         arr = seq.detach().cpu().numpy() if hasattr(seq, "cpu") else seq
         if arr.ndim == 5:
             if arr.shape[2] in (1, 3):
-                arr = np.transpose(arr[0], (0, 2, 3, 1))  # (B,F,C,H,W)→(F,H,W,C)
+                arr = np.transpose(arr[0], (0, 2, 3, 1))
             else:
-                arr = arr[0]  # (B,F,H,W,C)→(F,H,W,C)
+                arr = arr[0]
             f = arr.shape[0]
             frames_u8 = [_to_uint8_hwc(arr[i]) for i in range(f)]
             log.info(f"[JOB {job_id[:8]}] seq ndarray (5D) → {f} frames.")
             return frames_u8
         if arr.ndim == 4:
-            if arr.shape[1] in (1, 3):        # (F,C,H,W)→(F,H,W,C)
+            if arr.shape[1] in (1, 3):
                 arr = np.transpose(arr, (0, 2, 3, 1))
             f = arr.shape[0]
             frames_u8 = [_to_uint8_hwc(arr[i]) for i in range(f)]
             log.info(f"[JOB {job_id[:8]}] seq ndarray (4D) → {f} frames.")
             return frames_u8
-        if arr.ndim == 3:  # 단일 프레임
+        if arr.ndim == 3:
             frames_u8 = [_to_uint8_hwc(arr)]
             log.info(f"[JOB {job_id[:8]}] seq ndarray (3D) → 1 frame.")
             return frames_u8
-
-    # iterable (List[PIL], List[Tensor], List[np])
     if isinstance(seq, (list, tuple)):
         for idx, fr in enumerate(seq):
-            if hasattr(fr, "cpu"):  # torch tensor
+            if hasattr(fr, "cpu"):
                 fr = fr.detach().cpu().numpy()
             if isinstance(fr, PILImage.Image):
                 fr = np.array(fr)
@@ -426,7 +469,6 @@ def _normalize_frame_sequence(job_id: str, seq) -> List[np.ndarray]:
             frames_u8.append(_to_uint8_hwc(fr))
         log.info(f"[JOB {job_id[:8]}] seq iterable → {len(frames_u8)} frames.")
         return frames_u8
-
     raise TypeError(f"Unsupported frame sequence type: {type(seq)}")
 
 # ------------------------------
@@ -435,14 +477,9 @@ def _normalize_frame_sequence(job_id: str, seq) -> List[np.ndarray]:
 def _export_video(job_id: str, frames: List[np.ndarray], out_path: str, fps: int):
     log.info(f"[JOB {job_id[:8]}] encoding video -> {out_path}")
     JOBS[job_id]["progress"] = 0.96
-
-    # infer_once() 리턴 전에 찍히는 로그가 없으니, 아래처럼 보강:
     log.info(f"[JOB {job_id[:8]}] denoise steps finished. waiting for decode/post-processing…")
-
-    if not frames or len(frames) == 0:
+    if not frames:
         raise RuntimeError("No frames to encode.")
-
-    log.info(f"[JOB {job_id[:8]}] starting video writer for {len(frames)} frames…")
     writer = imageio.get_writer(
         out_path, fps=fps, codec="libx264",
         ffmpeg_params=["-crf", "18", "-preset", "medium"]
@@ -520,72 +557,85 @@ def start_job(
         t0 = time.time()
         try:
             JOBS[job_id]["status"] = "running"
-            pipe = get_i2v_pipe() if image_bytes else get_t2v_pipe()
+            is_i2v = image_bytes is not None
+            pipe = get_i2v_pipe() if is_i2v else get_t2v_pipe()
 
-            # 프레임/스텝 계획
+            # 총 프레임(정확히) 계산
+            total_frames_req = max(1, int(round(fps * duration_sec)))
+
+            # 기본 해상도/프레임 규칙 보정 + 스텝 고정(28)
             steps_local = num_inference_steps
-            raw_frames = max(8, min(int(round(fps * duration_sec)), 121))
-
-            # ✅ VRAM 기반 스케일링 → 모델 배수 스냅
-            w0, h0, f0, s0 = _autoscale_for_vram(width, height, raw_frames, steps_local, vram_gb=None)
+            w0, h0, frames_ruled, steps_fixed = _autoscale_for_vram(width, height, total_frames_req, steps_local, vram_gb=None)
             h, w = _snap_hw(w0, h0, pipe)
-            num_frames = f0
-            steps_local = s0
+            steps_local = steps_fixed  # 28 고정
 
-            plan_mp = _budget_megapixels(w, h, num_frames)
+            # 세그먼트 플랜
+            seg_plans = _plan_segments(frames_ruled, SEG_LEN_PREF, OVERLAP)
+            num_segments = len(seg_plans)
+            total_denoise_steps = max(1, steps_local) * max(1, num_segments)
+
+            plan_mp = _budget_megapixels(w, h, min(MAX_FRAMES_PER_CALL, SEG_LEN_PREF))
             log.info(
-                f"[JOB {job_id[:8]}] mode={'I2V' if image_bytes else 'T2V'} | "
-                f"req={width}x{height}@{raw_frames}f,{fps}fps, steps={num_inference_steps} → "
-                f"plan={w}x{h}@{num_frames}f, steps={steps_local} (~{plan_mp:.1f} MP) | "
+                f"[JOB {job_id[:8]}] mode={'I2V' if is_i2v else 'T2V'} | "
+                f"req={width}x{height}@{total_frames_req}f,{fps}fps, steps={num_inference_steps} → "
+                f"plan: {num_segments} segments (len~{SEG_LEN_PREF}, ov={OVERLAP}) @ {w}x{h}, "
+                f"per-call steps={steps_local} (~{plan_mp:.1f} MP/call) | "
                 f"gs={guidance_scale} | device={_device} ({_gpu_str()})"
             )
 
             JOBS[job_id]["progress"] = 0.05
-            step_times = []
-            last_step_ts = time.time()
 
-            def cb_on_step_end(pipe_, step: int, timestep, callback_kwargs):
-                nonlocal last_step_ts
-                pct = (step + 1) / float(steps_local)
-                JOBS[job_id]["progress"] = round(min(0.95, pct), 4)
-                now = time.time()
-                step_times.append(now - last_step_ts)
-                last_step_ts = now
-                avg = sum(step_times) / len(step_times) if step_times else 0.0
-                remain = max(0, steps_local - (step + 1))
-                eta = remain * avg
-                log.info(
-                    f"[JOB {job_id[:8]}] step {step+1}/{steps_local} "
-                    f"({pct*100:.1f}%) | ETA ~{eta:,.1f}s | GPU {_gpu_str()}"
-                )
-                return callback_kwargs
+            # 입력 이미지 준비(I2V)
+            original_img = _pil_from_bytes(image_bytes) if is_i2v else None
+            current_img = None
+            if original_img is not None:
+                original_img = original_img.resize((w, h), RESAMPLE_BICUBIC)
+                current_img = original_img.copy()
 
-            def cb_legacy(step: int, timestep, latents):
-                nonlocal last_step_ts
-                pct = (step + 1) / float(steps_local)
-                JOBS[job_id]["progress"] = round(min(0.95, pct), 4)
-                now = time.time()
-                step_times.append(now - last_step_ts)
-                last_step_ts = now
-                avg = sum(step_times) / len(step_times) if step_times else 0.0
-                remain = max(0, steps_local - (step + 1))
-                eta = remain * avg
-                log.info(
-                    f"[JOB {job_id[:8]}] step {step+1}/{steps_local} "
-                    f"({pct*100:.1f}%) | ETA ~{eta:,.1f}s | GPU {_gpu_str()}"
-                )
-                return latents
+            # 결과 프레임 버퍼
+            all_frames: List[np.ndarray] = []
+            denoise_step_counter = 0  # 전체 진행률 계산용
 
-            img = _pil_from_bytes(image_bytes) if image_bytes else None
-            if img is not None:
-                img = img.resize((w, h), RESAMPLE_BICUBIC)
+            # 공용 콜백(세그먼트 인덱스별 진행률 반영)
+            def make_on_step_end(seg_index: int):
+                def cb_on_step_end(pipe_, step: int, timestep, callback_kwargs):
+                    nonlocal denoise_step_counter
+                    # 현재 세그 내 step은 0..steps_local-1
+                    local_progress = (step + 1) / float(max(1, steps_local))
+                    # 세그 시작 전까지 완료된 스텝 수 + 현재 세그의 완료분
+                    done_steps = seg_index * max(1, steps_local) + (step + 1)
+                    denoise_step_counter = done_steps
+                    # 디노이즈 95%까지 할당
+                    denoise_pct = min(0.95, denoise_step_counter / float(total_denoise_steps))
+                    JOBS[job_id]["progress"] = round(max(JOBS[job_id]["progress"], denoise_pct), 4)
+                    if step % max(1, steps_local // 4) == 0:
+                        eta_steps = total_denoise_steps - done_steps
+                        log.info(
+                            f"[JOB {job_id[:8]}] seg {seg_index+1}/{num_segments} "
+                            f"step {step+1}/{steps_local} ({local_progress*100:.1f}%) | "
+                            f"GLOBAL {denoise_pct*100:.1f}% | ETA ~{eta_steps * 0.0 + 0:.1f}s | GPU {_gpu_str()}"
+                        )
+                    return callback_kwargs
+                return cb_on_step_end
 
-            def infer_once():
-                if _has_cuda:
-                    torch.cuda.synchronize()
-                    torch.cuda.reset_peak_memory_stats()
-                JOBS[job_id]["progress"] = max(JOBS[job_id]["progress"], 0.10)
-                log.info(f"[JOB {job_id[:8]}] start denoising…")
+            # ===== 세그먼트 루프 =====
+            for si, seg_len in enumerate(seg_plans):
+                # I2V: 세그 시작 시 앵커 리셋/블렌드
+                if is_i2v and original_img is not None:
+                    if USE_ANCHOR_EVERY_SEG:
+                        current_img = original_img.copy()
+                    elif USE_BLEND and current_img is not None:
+                        # 직전 프레임 기반 current_img와 원본 블렌드
+                        try:
+                            current_img = PILImage.blend(current_img, original_img, ALPHA_ORIG)
+                        except Exception:
+                            current_img = original_img.copy()
+                    else:
+                        # 기본: 직전 세그 마지막 프레임을 그대로 사용
+                        if current_img is None:
+                            current_img = original_img.copy()
+
+                # 파이프 호출
                 with torch.inference_mode():
                     ctx = torch.autocast("cuda", dtype=_dtype) if _has_cuda else nullcontext()
                     with ctx:
@@ -595,69 +645,63 @@ def start_job(
                             negative_prompt=negative_prompt,
                             height=h,
                             width=w,
-                            num_frames=num_frames,
+                            num_frames=seg_len,
                             num_inference_steps=steps_local,
                             guidance_scale=guidance_scale,
                         )
-                        # I2V에서만 image 전달 (시그니처 지원 시)
-                        if img is not None and "image" in sig_params:
-                            call_kwargs["image"] = img
-                        # 콜백들도 시그니처 존재 여부 기반으로만 세팅
+                        if is_i2v and "image" in sig_params:
+                            call_kwargs["image"] = current_img
                         if "callback_on_step_end" in sig_params:
-                            call_kwargs["callback_on_step_end"] = cb_on_step_end
-                        if not image_bytes and "callback" in sig_params:
-                            call_kwargs["callback"] = cb_legacy
-                        if not image_bytes and "callback_steps" in sig_params:
-                            call_kwargs["callback_steps"] = 1
+                            call_kwargs["callback_on_step_end"] = make_on_step_end(si)
+                        # (T2V 레거시 콜백은 비활성화: 세그 기반 전역 진행률이 더 정확)
                         try:
                             pipe.set_progress_bar_config(disable=True)
                         except Exception:
                             pass
-                        return pipe(**call_kwargs)
+                        out = pipe(**call_kwargs)
 
-            try:
-                out = infer_once()
-            except torch.cuda.OutOfMemoryError:
-                log.warning(f"[JOB {job_id[:8]}] OOM at start. Retrying smaller & offload…")
-                # 재시도도 VRAM 스케일러 재호출 (더 보수적)
-                w, h, num_frames, steps_local = _autoscale_for_vram(
-                    int(w * 0.85), int(h * 0.85), int(num_frames * 0.85), int(steps_local * 0.85)
-                )
-                h, w = _snap_hw(w, h, pipe)
-                try:
-                    # model offload 우선
-                    pipe.enable_model_cpu_offload()
-                except Exception:
+                # 프레임 추출
+                seg_frames = _extract_frames(job_id, out)  # 길이 seg_len 예상
+                if not seg_frames:
+                    raise RuntimeError(f"Segment {si} returned no frames.")
+                # I2V 다음 세그 준비용 current_img 업데이트: 이번 세그 마지막 프레임
+                if is_i2v:
                     try:
-                        pipe.enable_sequential_cpu_offload()
+                        current_img = PILImage.fromarray(seg_frames[-1])
                     except Exception:
-                        pass
-                if _USE_XFORMERS:
-                    try:
-                        pipe.enable_xformers_memory_efficient_attention()
-                    except Exception:
-                        pass
-                out = infer_once()
-            except Exception as e:
-                _fail_job(job_id, e)
-                return
+                        current_img = original_img.copy()
 
-            # ====== 출력 → 프레임 안전 추출 ======
-            try:
-                frames = _extract_frames(job_id, out)
-                log.info(f"[JOB {job_id[:8]}] Denoising complete. Extracted {len(frames)} frames.")
-            except Exception as e:
-                JOBS[job_id]["status"] = "error"
-                JOBS[job_id]["error"] = f"Frame extraction failed: {e}"
-                JOBS[job_id]["error_code"] = "FRAME_EXTRACTION_ERROR"
-                log.exception(f"[JOB {job_id[:8]}] FATAL FRAME EXTRACTION ERROR: {e}")
-                return
+                # 합치기(오버랩 크로스페이드)
+                if si == 0:
+                    all_frames.extend(seg_frames)
+                else:
+                    # 이전 꼬리와 현재 머리의 overlap 만큼 블렌딩
+                    tail = all_frames[-OVERLAP:] if len(all_frames) >= OVERLAP else all_frames[-1:]
+                    head = seg_frames[:OVERLAP] if len(seg_frames) >= OVERLAP else seg_frames[:1]
+                    blended = _crossfade_frames(tail, head, OVERLAP)
+                    # 이전 꼬리 제거(겹칠 부분)
+                    if OVERLAP > 0 and len(all_frames) >= len(tail):
+                        all_frames = all_frames[:-len(tail)]
+                    # 블렌드 + 이번 세그 전체 붙이되, 머리 overlap 부분은 블렌드로 대체했으니 제외
+                    all_frames.extend(blended)
+                    all_frames.extend(seg_frames[OVERLAP:])
+
+            # 총 길이를 정확히 자르거나 패딩(이론상 정확히 맞음. 안전 보정)
+            if len(all_frames) > total_frames_req:
+                all_frames = all_frames[:total_frames_req]
+            elif len(all_frames) < total_frames_req:
+                # 마지막 프레임 반복으로 패딩
+                if all_frames:
+                    last = all_frames[-1]
+                    all_frames.extend([last.copy() for _ in range(total_frames_req - len(all_frames))])
+
+            log.info(f"[JOB {job_id[:8]}] Denoising complete. Collected {len(all_frames)} frames (target {total_frames_req}).")
 
             # ====== 인코딩 (96% → 100%) ======
             try:
                 os.makedirs(download_dir, exist_ok=True)
                 out_path = os.path.join(download_dir, f"wan2_{job_id}.mp4")
-                _export_video(job_id, frames, out_path, fps=fps)
+                _export_video(job_id, all_frames, out_path, fps=fps)
             except Exception as e:
                 _fail_job(job_id, e)
                 return

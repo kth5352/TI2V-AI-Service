@@ -103,7 +103,7 @@ async def stream(job_id: str):
 
 @app.get("/api/video/{filename}")
 def get_video(filename: str):
-    path = os.path.join("backend", "downloads", filename)
+    path = os.path.join("downloads", filename)
     if not os.path.exists(path):
         raise HTTPException(404, "file not found")
     return FileResponse(path, media_type="video/mp4", filename=filename)
