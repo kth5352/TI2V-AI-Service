@@ -9,7 +9,7 @@ FastAPI 엔드포인트 레이어
 
 리팩토링 포인트
 1) 명시적 Pydantic 모델과 타입힌트로 응답 스키마 고정
-2) 에러 응답에서도 error_code 표준화(비즈니스 레이어(video_worker)와 일치)
+2) 에러 응답에서도 error_code 표준화(비즈니스 레이어(worker)와 일치)
 3) 공통 헤더/설정 상수화, CORS 도메인은 환경변수로 override 가능
 4) 반복문 스트림에서 변화가 있을 때만 push + done/error 시 정상 종료
 5) 상태코드/메시지는 FastAPI 표준 예외로 통일
@@ -27,7 +27,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Pla
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, PositiveInt, PositiveFloat
 
-from video_worker import start_job, JOBS, MEDIA_DIR
+from worker import start_job, JOBS, MEDIA_DIR
+
 
 # ---------------------------------------------------------------------
 # 설정 상수
@@ -79,7 +80,7 @@ async def generate(
     """
     비디오 생성 잡을 시작한다.
     - image가 있으면 I2V, 없으면 T2V
-    - 상세 파이프라인/진행률/에러코드는 video_worker에서 관리
+    - 상세 파이프라인/진행률/에러코드는 error에서 관리
     """
     img_bytes = await image.read() if image is not None else None
 
@@ -179,7 +180,6 @@ async def stream(job_id: str):
 def get_video(filename: str):
     """
     생성된 mp4를 서빙한다.
-    - 실제 파일시스템 경로는 video_worker.MEDIA_DIR 하위
     """
     path = os.path.join(MEDIA_DIR, filename)
     if not os.path.exists(path):
