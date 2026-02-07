@@ -13,4 +13,6 @@ yarn run dev
 
 python 3.1x 버전 설치 후
 backend 디렉토리에서
+```
 py main.py
+```
